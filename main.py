@@ -21,6 +21,7 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=False,
 DATA: pd.DataFrame | None = None
 LAST_MODEL = None
 LAST_FEATURES: list[str] = []
+TELEGRAM_SENT: set[tuple[str, str]] = set()
 
 class TrainRequest(BaseModel):
     model: Literal["logistic", "random_forest", "hist_gradient_boosting"] = "logistic"
@@ -192,3 +193,152 @@ def pattern_study():
         else: ci = None
         out.append({"pattern": name, "occurrences": n, "next_candle_up_rate": None if rate is None else round(rate, 4), "wilson_95_ci": ci})
     return {"patterns": out, "warning": "Descriptive in-sample rates only; use a held-out period and correct for multiple comparisons before making claims."}
+
+# Optional live-data signal endpoint. Requires a licensed Twelve Data API key in the server environment.
+import os
+import requests
+from datetime import datetime, timezone, timedelta
+from pathlib import Path
+
+@app.get('/live/signal')
+def live_signal(symbol: str = 'EUR/USD', model: Literal['logistic','random_forest','hist_gradient_boosting'] = 'logistic', threshold: float = 0.60, notify_telegram: bool = False):
+    """Generate a read-only research estimate from the latest completed 5-minute candle.
+
+    This endpoint does not connect to Quotex or place trades. API-provider data may differ
+    from a broker's own feed. The returned probability is a model estimate, not a guarantee.
+    """
+    api_key = os.getenv('TWELVE_DATA_API_KEY') or os.getenv('MARKET_DATA_API_KEY')
+    if not api_key:
+        raise HTTPException(503, 'Live data is not configured. Set TWELVE_DATA_API_KEY on the backend server; never put it in browser code.')
+    allowed = {'EUR/USD','GBP/USD','USD/JPY','AUD/USD','USD/CAD','USD/CHF','NZD/USD'}
+    symbol = symbol.upper().replace(' ', '')
+    if symbol not in allowed:
+        raise HTTPException(400, f'Supported symbols: {", ".join(sorted(allowed))}')
+    if not 0.50 <= threshold <= 0.85:
+        raise HTTPException(400, 'threshold must be between 0.50 and 0.85')
+    try:
+        response = requests.get('https://api.twelvedata.com/time_series', params={
+            'symbol': symbol, 'interval': '5min', 'outputsize': 5000,
+            'timezone': 'UTC', 'order': 'ASC', 'apikey': api_key,
+        }, timeout=20)
+        response.raise_for_status()
+        payload = response.json()
+        if payload.get('status') == 'error' or not payload.get('values'):
+            raise ValueError(payload.get('message', 'No candle data returned by provider.'))
+        candles = pd.DataFrame(payload['values']).rename(columns={'datetime':'timestamp'})
+        candles = normalize_live_frame(candles)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(502, f'Could not retrieve live market data: {exc}') from exc
+    if len(candles) < 500:
+        raise HTTPException(422, f'Provider returned only {len(candles)} candles; at least 500 are required for this prototype.')
+
+    # Add a dummy next row solely so feature generation includes the most recent real candle.
+    # Exclude that dummy-labelled row from model fitting and use its feature row only for prediction.
+    last_ts = candles['timestamp'].iloc[-1]
+    dummy = pd.DataFrame([{'timestamp': last_ts + pd.Timedelta(minutes=5),
+                           'open': candles['close'].iloc[-1], 'high': candles['close'].iloc[-1],
+                           'low': candles['close'].iloc[-1], 'close': candles['close'].iloc[-1]}])
+    extended = pd.concat([candles, dummy], ignore_index=True)
+    X, y, _ = make_features(extended)
+    X = X.replace([np.inf, -np.inf], np.nan)
+    if len(X) < 300:
+        raise HTTPException(422, 'Not enough usable feature rows after preparation.')
+    X_train = X.iloc[:-1]
+    y_train = y.iloc[:-1]
+    X_now = X.iloc[[-1]]
+    # Time-ordered holdout diagnostic on the downloaded data (not a live-performance guarantee).
+    split = max(200, int(len(X_train) * 0.8))
+    split = min(split, len(X_train) - 50)
+    estimator = make_estimator(model)
+    estimator.fit(X_train.iloc[:split], y_train.iloc[:split])
+    holdout_pred = estimator.predict(X_train.iloc[split:])
+    holdout_acc = float(accuracy_score(y_train.iloc[split:], holdout_pred))
+    # Refit on all known labelled rows before making the next-candle estimate.
+    estimator.fit(X_train, y_train)
+    probability_up = float(estimator.predict_proba(X_now)[0, 1])
+    probability_down = 1.0 - probability_up
+    if max(probability_up, probability_down) < threshold:
+        direction = 'NO SIGNAL'
+        probability = max(probability_up, probability_down)
+    else:
+        direction = 'CALL / UP' if probability_up > probability_down else 'PUT / DOWN'
+        probability = max(probability_up, probability_down)
+    # Do not claim a forecast for a candle that has already closed: identify the next 5-minute boundary.
+    now = datetime.now(timezone.utc)
+    next_boundary = now.replace(second=0, microsecond=0)
+    next_boundary = next_boundary + timedelta(minutes=(5 - next_boundary.minute % 5))
+    last = candles.iloc[-1]
+    result = {
+        'ok': True, 'source': 'Twelve Data', 'symbol': symbol, 'timeframe': '5min',
+        'signal': direction, 'probability': round(probability, 4),
+        'probability_up': round(probability_up, 4), 'probability_down': round(probability_down, 4),
+        'threshold': threshold, 'model': model, 'candles_used': int(len(candles)),
+        'last_completed_candle_utc': last_ts.isoformat(),
+        'next_candle_start_estimate_utc': next_boundary.isoformat(),
+        'last_close': float(last['close']), 'holdout_accuracy_diagnostic': round(holdout_acc, 4),
+        'telegram_notified': False,
+        'warning': 'Research estimate only. Provider prices may differ from Quotex quotes. This is not a guaranteed prediction or financial advice; paper-test before relying on it.'
+    }
+    if notify_telegram and direction != 'NO SIGNAL':
+        result['telegram_notified'] = send_telegram_signal(result)
+    return result
+
+
+def normalize_live_frame(frame: pd.DataFrame) -> pd.DataFrame:
+    frame = frame.copy()
+    frame['timestamp'] = pd.to_datetime(frame['timestamp'], utc=True, errors='coerce')
+    for col in ('open','high','low','close'):
+        frame[col] = pd.to_numeric(frame[col], errors='coerce')
+    frame = frame.dropna(subset=['timestamp','open','high','low','close']).sort_values('timestamp')
+    frame = frame.drop_duplicates('timestamp', keep='last').reset_index(drop=True)
+    if (frame['high'] < frame[['open','close','low']].max(axis=1)).any() or (frame['low'] > frame[['open','close','high']].min(axis=1)).any():
+        raise ValueError('Provider returned invalid OHLC rows.')
+    return frame
+
+
+def send_telegram_message(message: str) -> None:
+    token = os.getenv("TELEGRAM_BOT_TOKEN")
+    chat_id = os.getenv("TELEGRAM_CHAT_ID")
+    if not token or not chat_id:
+        raise HTTPException(503, "Telegram is not configured. Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID in your hosting environment.")
+    try:
+        response = requests.post(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            json={"chat_id": chat_id, "text": message, "disable_web_page_preview": True},
+            timeout=10,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        if not payload.get("ok"):
+            raise ValueError(payload.get("description", "Telegram rejected the message"))
+    except Exception as exc:
+        raise HTTPException(502, f"Telegram message failed: {exc}") from exc
+
+def send_telegram_signal(result: dict) -> bool:
+    key = (result["symbol"], result["last_completed_candle_utc"])
+    if key in TELEGRAM_SENT:
+        return False
+    message = (
+        f"FX Research Lab — research signal\n"
+        f"Pair: {result['symbol']} | Timeframe: 5m\n"
+        f"Estimate: {result['signal']}\n"
+        f"Model probability: {result['probability']:.1%}\n"
+        f"Last completed candle (UTC): {result['last_completed_candle_utc']}\n"
+        f"Holdout accuracy diagnostic: {result['holdout_accuracy_diagnostic']:.1%}\n"
+        "Research only; not a guarantee. Verify the instrument/feed before acting."
+    )
+    send_telegram_message(message)
+    TELEGRAM_SENT.add(key)
+    return True
+
+@app.post("/telegram/test")
+def telegram_test():
+    send_telegram_message("FX Research Lab: Telegram connection test successful. This bot sends research alerts only.")
+    return {"ok": True, "message": "Telegram test message sent."}
+
+@app.get("/")
+def dashboard():
+    from fastapi.responses import FileResponse
+    return FileResponse(Path(__file__).resolve().parent.parent / "index.html")
