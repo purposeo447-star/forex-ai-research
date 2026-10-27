@@ -207,30 +207,72 @@ def live_signal(symbol: str = 'EUR/USD', model: Literal['logistic','random_fores
     This endpoint does not connect to Quotex or place trades. API-provider data may differ
     from a broker's own feed. The returned probability is a model estimate, not a guarantee.
     """
-    api_key = os.getenv('TWELVE_DATA_API_KEY') or os.getenv('MARKET_DATA_API_KEY')
-    if not api_key:
-        raise HTTPException(503, 'Live data is not configured. Set TWELVE_DATA_API_KEY on the backend server; never put it in browser code.')
     allowed = {'EUR/USD','GBP/USD','USD/JPY','AUD/USD','USD/CAD','USD/CHF','NZD/USD'}
     symbol = symbol.upper().replace(' ', '')
     if symbol not in allowed:
         raise HTTPException(400, f'Supported symbols: {", ".join(sorted(allowed))}')
     if not 0.50 <= threshold <= 0.85:
         raise HTTPException(400, 'threshold must be between 0.50 and 0.85')
-    try:
-        response = requests.get('https://api.twelvedata.com/time_series', params={
-            'symbol': symbol, 'interval': '5min', 'outputsize': 5000,
-            'timezone': 'UTC', 'order': 'ASC', 'apikey': api_key,
-        }, timeout=20)
-        response.raise_for_status()
-        payload = response.json()
-        if payload.get('status') == 'error' or not payload.get('values'):
-            raise ValueError(payload.get('message', 'No candle data returned by provider.'))
-        candles = pd.DataFrame(payload['values']).rename(columns={'datetime':'timestamp'})
-        candles = normalize_live_frame(candles)
-    except HTTPException:
-        raise
-    except Exception as exc:
-        raise HTTPException(502, f'Could not retrieve live market data: {exc}') from exc
+
+    api_key = os.getenv('TWELVE_DATA_API_KEY') or os.getenv('MARKET_DATA_API_KEY')
+    source = 'Twelve Data'
+    candles = None
+    provider_errors = []
+
+    # Prefer the configured Twelve Data provider. If it is unavailable or unconfigured,
+    # try Yahoo Finance's public chart endpoint as a best-effort research fallback.
+    if api_key:
+        try:
+            response = requests.get('https://api.twelvedata.com/time_series', params={
+                'symbol': symbol, 'interval': '5min', 'outputsize': 5000,
+                'timezone': 'UTC', 'order': 'ASC', 'apikey': api_key,
+            }, timeout=20)
+            response.raise_for_status()
+            payload = response.json()
+            if payload.get('status') == 'error' or not payload.get('values'):
+                raise ValueError(payload.get('message', 'No candle data returned by Twelve Data.'))
+            candles = normalize_live_frame(
+                pd.DataFrame(payload['values']).rename(columns={'datetime': 'timestamp'})
+            )
+        except Exception as exc:
+            provider_errors.append(f'Twelve Data: {exc}')
+
+    if candles is None:
+        yahoo_symbol = symbol.replace('/', '') + '=X'
+        try:
+            response = requests.get(
+                f'https://query1.finance.yahoo.com/v8/finance/chart/{yahoo_symbol}',
+                params={'range': '60d', 'interval': '5m', 'events': 'history'},
+                headers={'User-Agent': 'Mozilla/5.0 FXResearchLab/1.0'},
+                timeout=20,
+            )
+            response.raise_for_status()
+            payload = response.json()
+            chart = payload.get('chart', {})
+            if chart.get('error') or not chart.get('result'):
+                raise ValueError(str(chart.get('error') or 'No chart data returned by Yahoo Finance.'))
+            item = chart['result'][0]
+            quote = item.get('indicators', {}).get('quote', [{}])[0]
+            timestamps = item.get('timestamp', [])
+            if not timestamps or not quote:
+                raise ValueError('Yahoo Finance returned no intraday candles.')
+            candles = pd.DataFrame({
+                'timestamp': pd.to_datetime(timestamps, unit='s', utc=True),
+                'open': quote.get('open', []),
+                'high': quote.get('high', []),
+                'low': quote.get('low', []),
+                'close': quote.get('close', []),
+            })
+            candles = normalize_live_frame(candles)
+            source = 'Yahoo Finance (public fallback)'
+        except Exception as exc:
+            provider_errors.append(f'Yahoo Finance: {exc}')
+            detail = ' | '.join(provider_errors)
+            raise HTTPException(
+                502,
+                'Could not retrieve live candles from Twelve Data or Yahoo Finance. '
+                'Check provider availability, symbol support, and Render logs. Details: ' + detail
+            ) from exc
     if len(candles) < 500:
         raise HTTPException(422, f'Provider returned only {len(candles)} candles; at least 500 are required for this prototype.')
 
@@ -271,7 +313,7 @@ def live_signal(symbol: str = 'EUR/USD', model: Literal['logistic','random_fores
     next_boundary = next_boundary + timedelta(minutes=(5 - next_boundary.minute % 5))
     last = candles.iloc[-1]
     result = {
-        'ok': True, 'source': 'Twelve Data', 'symbol': symbol, 'timeframe': '5min',
+        'ok': True, 'source': source, 'symbol': symbol, 'timeframe': '5min',
         'signal': direction, 'probability': round(probability, 4),
         'probability_up': round(probability_up, 4), 'probability_down': round(probability_down, 4),
         'threshold': threshold, 'model': model, 'candles_used': int(len(candles)),
@@ -279,7 +321,7 @@ def live_signal(symbol: str = 'EUR/USD', model: Literal['logistic','random_fores
         'next_candle_start_estimate_utc': next_boundary.isoformat(),
         'last_close': float(last['close']), 'holdout_accuracy_diagnostic': round(holdout_acc, 4),
         'telegram_notified': False,
-        'warning': 'Research estimate only. Provider prices may differ from Quotex quotes. This is not a guaranteed prediction or financial advice; paper-test before relying on it.'
+        'warning': 'Research estimate only. Yahoo public intraday data may be delayed, incomplete, rate-limited, or unavailable. Provider prices may differ from broker quotes. Not a guaranteed prediction or financial advice; paper-test before relying on it.'
     }
     if notify_telegram and direction != 'NO SIGNAL':
         result['telegram_notified'] = send_telegram_signal(result)
